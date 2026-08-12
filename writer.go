@@ -10,36 +10,59 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
-// Writer is the type that is used to write a new shapefile.
-type Writer struct {
-	filename     string
-	shp          writeSeekCloser
-	shx          writeSeekCloser
-	GeometryType ShapeType
-	num          int32
-	bbox         Box
-
-	dbf             writeSeekCloser
-	dbfFields       []Field
-	dbfHeaderLength int16
-	dbfRecordLength int16
-}
-
-type writeSeekCloser interface {
+// WriteSeekCloser is the union of io.Writer, io.Seeker and io.Closer. It is
+// the minimum interface needed to write one component of a shapefile.
+type WriteSeekCloser interface {
 	io.Writer
 	io.Seeker
 	io.Closer
 }
 
-// Create returns a point to new Writer and the first error that was
-// encountered. In case an error occurred the returned Writer point will be nil
-// This also creates a corresponding SHX file. It is important to use Close()
-// when done because that method writes all the headers for each file (SHP, SHX
-// and DBF).
-// If filename does not end on ".shp" already, it will be treated as the basename
-// for the file and the ".shp" extension will be appended to that name.
+// Writer is the type that is used to write a new shapefile.
+type Writer struct {
+	filename     string
+	shp          WriteSeekCloser
+	shx          WriteSeekCloser
+	GeometryType ShapeType
+	num          int32
+	bbox         Box
+
+	dbf             WriteSeekCloser
+	dbfFields       []Field
+	dbfFieldsSet    bool
+	dbfHeaderLength int16
+	dbfRecordLength int16
+
+	prj string
+	cpg string
+}
+
+// errWriter captures the first write error so a sequence of writes can be
+// checked once at the end.
+type errWriter struct {
+	io.Writer
+	e error
+}
+
+func (ew *errWriter) Write(p []byte) (int, error) {
+	if ew.e != nil {
+		return 0, ew.e
+	}
+	n, err := ew.Writer.Write(p)
+	if err != nil {
+		ew.e = err
+	}
+	return n, err
+}
+
+// Create returns a new Writer backed by files named after filename. It is
+// important to call Close when done because that method writes the headers for
+// each file (SHP, SHX and DBF) and any sidecar files (PRJ, CPG).
+// If filename ends in ".shp", it is treated as the basename and the ".shp"
+// extension is not duplicated.
 func Create(filename string, t ShapeType) (*Writer, error) {
 	if strings.HasSuffix(strings.ToLower(filename), ".shp") {
 		filename = filename[0 : len(filename)-4]
@@ -50,21 +73,40 @@ func Create(filename string, t ShapeType) (*Writer, error) {
 	}
 	shx, err := os.Create(filename + ".shx")
 	if err != nil {
+		shp.Close()
 		return nil, err
 	}
-	shp.Seek(100, io.SeekStart)
-	shx.Seek(100, io.SeekStart)
-	w := &Writer{
-		filename:     filename,
-		shp:          shp,
-		shx:          shx,
-		GeometryType: t,
+	w, err := CreateFromWriteSeekClosers(shp, shx, nil, t)
+	if err != nil {
+		shp.Close()
+		shx.Close()
+		return nil, err
 	}
+	w.filename = filename
 	return w, nil
 }
 
-// Append returns a Writer pointer that will append to the given shapefile and
-// the first error that was encounted during creation of that Writer. The
+// CreateFromWriteSeekClosers returns a new Writer writing the SHP and SHX
+// components to the provided write-seek-closers. dbf may be nil; in that case
+// a DBF is only produced if SetFields is called with a filename-backed writer.
+// It is important to call Close when done so headers are written.
+func CreateFromWriteSeekClosers(shp, shx, dbf WriteSeekCloser, t ShapeType) (*Writer, error) {
+	if _, err := shp.Seek(100, io.SeekStart); err != nil {
+		return nil, fmt.Errorf("seek shp header: %w", err)
+	}
+	if _, err := shx.Seek(100, io.SeekStart); err != nil {
+		return nil, fmt.Errorf("seek shx header: %w", err)
+	}
+	return &Writer{
+		shp:          shp,
+		shx:          shx,
+		dbf:          dbf,
+		GeometryType: t,
+	}, nil
+}
+
+// Append returns a Writer that will append to the given shapefile and the
+// first error that was encountered during creation of that Writer. The
 // shapefile must have a valid index file.
 func Append(filename string) (*Writer, error) {
 	shp, err := os.OpenFile(filename, os.O_RDWR, 0666)
@@ -95,10 +137,6 @@ func Append(filename string) (*Writer, error) {
 	}
 
 	shx, err := os.OpenFile(basename+".shx", os.O_RDWR, 0666)
-	if os.IsNotExist(err) {
-		// TODO allow index file to not exist, in that case just
-		// read through all the shapes and create it on the fly
-	}
 	if err != nil {
 		return nil, fmt.Errorf("cannot open shapefile index: %v", err)
 	}
@@ -130,7 +168,7 @@ func Append(filename string) (*Writer, error) {
 	}
 	w.shx = shx
 
-	dbf, err := os.Open(basename + ".dbf")
+	dbf, err := os.OpenFile(basename+".dbf", os.O_RDWR, 0666)
 	if os.IsNotExist(err) {
 		return w, nil // it's okay if the DBF does not exist
 	}
@@ -166,177 +204,329 @@ func Append(filename string) (*Writer, error) {
 		return nil, fmt.Errorf("cannot seek to DBF end: %v", err)
 	}
 	w.dbf = dbf
+	w.dbfFieldsSet = true
 
 	return w, nil
 }
 
-// Write shape to the Shapefile. This also creates
-// a record in the SHX file and DBF file (if it is
-// initialized). Returns the index of the written object
-// which can be used in WriteAttribute.
-func (w *Writer) Write(shape Shape) int32 {
-	// increate bbox
+// Write writes a shape to the shapefile. This also creates a record in the
+// SHX file and DBF file (if it is initialized). It returns the index of the
+// written object, which can be used with WriteAttribute.
+func (w *Writer) Write(shape Shape) (int32, error) {
 	if w.num == 0 {
 		w.bbox = shape.BBox()
 	} else {
 		w.bbox.Extend(shape.BBox())
 	}
-
 	w.num++
-	binary.Write(w.shp, binary.BigEndian, w.num)
-	w.shp.Seek(4, io.SeekCurrent)
-	start, _ := w.shp.Seek(0, io.SeekCurrent)
-	binary.Write(w.shp, binary.LittleEndian, w.GeometryType)
-	shape.write(w.shp)
-	finish, _ := w.shp.Seek(0, io.SeekCurrent)
+
+	if err := binary.Write(w.shp, binary.BigEndian, w.num); err != nil {
+		return -1, fmt.Errorf("write record number: %w", err)
+	}
+	if _, err := w.shp.Seek(4, io.SeekCurrent); err != nil {
+		return -1, fmt.Errorf("seek content length field: %w", err)
+	}
+	start, err := w.shp.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return -1, fmt.Errorf("seek record start: %w", err)
+	}
+	if err := binary.Write(w.shp, binary.LittleEndian, w.GeometryType); err != nil {
+		return -1, fmt.Errorf("write shape type: %w", err)
+	}
+
+	ew := &errWriter{Writer: w.shp}
+	shape.write(ew)
+	if ew.e != nil {
+		return -1, fmt.Errorf("write shape payload: %w", ew.e)
+	}
+
+	finish, err := w.shp.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return -1, fmt.Errorf("seek record end: %w", err)
+	}
 	length := int32(math.Floor((float64(finish) - float64(start)) / 2.0))
-	w.shp.Seek(start-4, io.SeekStart)
-	binary.Write(w.shp, binary.BigEndian, length)
-	w.shp.Seek(finish, io.SeekStart)
+	if _, err := w.shp.Seek(start-4, io.SeekStart); err != nil {
+		return -1, fmt.Errorf("seek content length field: %w", err)
+	}
+	if err := binary.Write(w.shp, binary.BigEndian, length); err != nil {
+		return -1, fmt.Errorf("write content length: %w", err)
+	}
+	if _, err := w.shp.Seek(finish, io.SeekStart); err != nil {
+		return -1, fmt.Errorf("seek record end: %w", err)
+	}
 
-	// write shx
-	binary.Write(w.shx, binary.BigEndian, int32((start-8)/2))
-	binary.Write(w.shx, binary.BigEndian, length)
+	if err := binary.Write(w.shx, binary.BigEndian, int32((start-8)/2)); err != nil {
+		return -1, fmt.Errorf("write shx offset: %w", err)
+	}
+	if err := binary.Write(w.shx, binary.BigEndian, length); err != nil {
+		return -1, fmt.Errorf("write shx length: %w", err)
+	}
 
-	// write empty record to dbf
 	if w.dbf != nil {
-		w.writeEmptyRecord()
+		if err := w.writeEmptyRecord(); err != nil {
+			return -1, fmt.Errorf("write DBF empty record: %w", err)
+		}
 	}
 
-	return w.num - 1
+	return w.num - 1, nil
 }
 
-// Close closes the Writer. This must be used at the end of
-// the transaction because it writes the correct headers
-// to the SHP/SHX and DBF files before closing.
-func (w *Writer) Close() {
-	w.writeHeader(w.shx)
-	w.writeHeader(w.shp)
-	w.shp.Close()
-	w.shx.Close()
+// SetProjection records the WKT projection string written to a .prj sidecar
+// file when Close is called. It is only effective for filename-backed writers.
+func (w *Writer) SetProjection(wkt string) {
+	w.prj = wkt
+}
 
-	if w.dbf == nil {
-		w.SetFields([]Field{})
+// SetEncoding records the code page written to a .cpg sidecar file when Close
+// is called (e.g. "UTF-8"). It is only effective for filename-backed writers.
+func (w *Writer) SetEncoding(code string) {
+	w.cpg = code
+}
+
+// Close writes the headers for the SHP, SHX and DBF files, writes any PRJ/CPG
+// sidecar files, and closes all underlying files. It must be called when
+// writing is done. The returned error aggregates every failure encountered.
+func (w *Writer) Close() error {
+	if (w.prj != "" || w.cpg != "") && w.filename == "" {
+		return errors.New("projection/encoding set but writer has no filename for sidecar files")
 	}
-	w.writeDbfHeader(w.dbf)
-	w.dbf.Close()
+
+	var errs []error
+	if err := w.writeHeader(w.shx); err != nil {
+		errs = append(errs, fmt.Errorf("write shx header: %w", err))
+	}
+	if err := w.writeHeader(w.shp); err != nil {
+		errs = append(errs, fmt.Errorf("write shp header: %w", err))
+	}
+
+	if w.dbf == nil && w.filename != "" {
+		if err := w.SetFields([]Field{}); err != nil {
+			errs = append(errs, fmt.Errorf("initialize empty DBF: %w", err))
+		}
+	}
+	if w.dbf != nil {
+		if err := w.writeDbfHeader(w.dbf); err != nil {
+			errs = append(errs, fmt.Errorf("write DBF header: %w", err))
+		}
+	}
+
+	if w.filename != "" {
+		if w.prj != "" {
+			if err := os.WriteFile(w.filename+".prj", []byte(w.prj), 0644); err != nil {
+				errs = append(errs, fmt.Errorf("write .prj: %w", err))
+			}
+		}
+		if w.cpg != "" {
+			if err := os.WriteFile(w.filename+".cpg", []byte(w.cpg), 0644); err != nil {
+				errs = append(errs, fmt.Errorf("write .cpg: %w", err))
+			}
+		}
+	}
+
+	if err := w.shp.Close(); err != nil {
+		errs = append(errs, fmt.Errorf("close shp: %w", err))
+	}
+	if err := w.shx.Close(); err != nil {
+		errs = append(errs, fmt.Errorf("close shx: %w", err))
+	}
+	if w.dbf != nil {
+		if err := w.dbf.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("close dbf: %w", err))
+		}
+	}
+
+	return errors.Join(errs...)
 }
 
-// writeHeader wrires SHP/SHX headers to ws.
-func (w *Writer) writeHeader(ws io.WriteSeeker) {
-	filelength, _ := ws.Seek(0, io.SeekEnd)
+// writeHeader writes the SHP/SHX header to ws.
+func (w *Writer) writeHeader(ws io.WriteSeeker) error {
+	filelength, err := ws.Seek(0, io.SeekEnd)
+	if err != nil {
+		return err
+	}
 	if filelength == 0 {
 		filelength = 100
 	}
-	ws.Seek(0, io.SeekStart)
-	// file code
-	binary.Write(ws, binary.BigEndian, []int32{9994, 0, 0, 0, 0, 0})
-	// file length
-	binary.Write(ws, binary.BigEndian, int32(filelength/2))
-	// version and shape type
-	binary.Write(ws, binary.LittleEndian, []int32{1000, int32(w.GeometryType)})
-	// bounding box
-	binary.Write(ws, binary.LittleEndian, w.bbox)
-	// elevation, measure
-	binary.Write(ws, binary.LittleEndian, []float64{0.0, 0.0, 0.0, 0.0})
+	if _, err := ws.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	if err := binary.Write(ws, binary.BigEndian, []int32{9994, 0, 0, 0, 0, 0}); err != nil {
+		return err
+	}
+	if err := binary.Write(ws, binary.BigEndian, int32(filelength/2)); err != nil {
+		return err
+	}
+	if err := binary.Write(ws, binary.LittleEndian, []int32{1000, int32(w.GeometryType)}); err != nil {
+		return err
+	}
+	if err := binary.Write(ws, binary.LittleEndian, w.bbox); err != nil {
+		return err
+	}
+	return binary.Write(ws, binary.LittleEndian, []float64{0.0, 0.0, 0.0, 0.0})
 }
 
 // writeDbfHeader writes a DBF header to ws.
-func (w *Writer) writeDbfHeader(ws io.WriteSeeker) {
-	ws.Seek(0, 0)
-	// version, year (YEAR-1990), month, day
-	binary.Write(ws, binary.LittleEndian, []byte{3, 24, 5, 3})
-	// number of records
-	binary.Write(ws, binary.LittleEndian, w.num)
-	// header length, record length
-	binary.Write(ws, binary.LittleEndian, []int16{w.dbfHeaderLength, w.dbfRecordLength})
-	// padding
-	binary.Write(ws, binary.LittleEndian, make([]byte, 20))
-
-	for _, field := range w.dbfFields {
-		binary.Write(ws, binary.LittleEndian, field)
+func (w *Writer) writeDbfHeader(ws io.WriteSeeker) error {
+	if _, err := ws.Seek(0, 0); err != nil {
+		return err
 	}
-
-	// end with return
-	ws.Write([]byte("\r"))
+	if err := binary.Write(ws, binary.LittleEndian, []byte{3, 24, 5, 3}); err != nil {
+		return err
+	}
+	if err := binary.Write(ws, binary.LittleEndian, w.num); err != nil {
+		return err
+	}
+	if err := binary.Write(ws, binary.LittleEndian, []int16{w.dbfHeaderLength, w.dbfRecordLength}); err != nil {
+		return err
+	}
+	if err := binary.Write(ws, binary.LittleEndian, make([]byte, 20)); err != nil {
+		return err
+	}
+	for _, field := range w.dbfFields {
+		if err := binary.Write(ws, binary.LittleEndian, field); err != nil {
+			return err
+		}
+	}
+	_, err := ws.Write([]byte("\r"))
+	return err
 }
 
-// SetFields sets field values in the DBF. This initializes the DBF file and
+// SetFields sets field values in the DBF. It initializes the DBF file and
 // should be used prior to writing any attributes.
 func (w *Writer) SetFields(fields []Field) error {
-	if w.dbf != nil {
-		return errors.New("Cannot set fields in existing dbf")
+	for i, field := range fields {
+		name := field.String()
+		if err := validateFieldName(name); err != nil {
+			return fmt.Errorf("field %d (%q): %w", i, name, err)
+		}
 	}
-
-	var err error
-	w.dbf, err = os.Create(w.filename + ".dbf")
-	if err != nil {
-		return fmt.Errorf("Failed to open %s.dbf: %v", w.filename, err)
+	if w.dbfFieldsSet {
+		return errors.New("cannot set fields: DBF fields already set")
+	}
+	if w.dbf == nil {
+		if w.filename == "" {
+			return errors.New("cannot initialize DBF: no filename and no DBF writer")
+		}
+		var err error
+		w.dbf, err = os.Create(w.filename + ".dbf")
+		if err != nil {
+			return fmt.Errorf("failed to open %s.dbf: %w", w.filename, err)
+		}
 	}
 	w.dbfFields = fields
+	w.dbfFieldsSet = true
 
-	// calculate record length
 	w.dbfRecordLength = int16(1)
-	for _, field := range w.dbfFields {
+	for _, field := range fields {
 		w.dbfRecordLength += int16(field.Size)
 	}
+	w.dbfHeaderLength = int16(len(fields)*32 + 33)
 
-	// header lengh
-	w.dbfHeaderLength = int16(len(w.dbfFields)*32 + 33)
-
-	// fill header space with empty bytes for now
 	buf := make([]byte, w.dbfHeaderLength)
-	binary.Write(w.dbf, binary.LittleEndian, buf)
-
-	// write empty records
+	if _, err := w.dbf.Write(buf); err != nil {
+		return fmt.Errorf("write DBF header space: %w", err)
+	}
 	for n := int32(0); n < w.num; n++ {
-		w.writeEmptyRecord()
+		if err := w.writeEmptyRecord(); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
-// Writes an empty record to the end of the DBF. This
-// works by seeking to the end of the file and writing
-// dbfRecordLength number of bytes. The first byte is a
-// space that indicates a new record.
-func (w *Writer) writeEmptyRecord() {
-	w.dbf.Seek(0, io.SeekEnd)
+// writeEmptyRecord writes an empty record to the end of the DBF. This works by
+// seeking to the end of the file and writing dbfRecordLength bytes. The first
+// byte is a space that indicates a new record.
+func (w *Writer) writeEmptyRecord() error {
+	if _, err := w.dbf.Seek(0, io.SeekEnd); err != nil {
+		return err
+	}
 	buf := make([]byte, w.dbfRecordLength)
 	buf[0] = ' '
-	binary.Write(w.dbf, binary.LittleEndian, buf)
+	_, err := w.dbf.Write(buf)
+	return err
 }
 
 // WriteAttribute writes value for field into the given row in the DBF. Row
 // number should be the same as the order the Shape was written to the
-// Shapefile. The field value corresponds to the field in the slice used in
+// shapefile. The field value corresponds to the field in the slice used in
 // SetFields.
 func (w *Writer) WriteAttribute(row int, field int, value interface{}) error {
-	var buf []byte
-	switch v := value.(type) {
-	case int:
-		buf = []byte(strconv.Itoa(v))
-	case float64:
-		precision := w.dbfFields[field].Precision
-		buf = []byte(strconv.FormatFloat(v, 'f', int(precision), 64))
-	case string:
-		buf = []byte(v)
-	default:
-		return fmt.Errorf("Unsupported value type: %T", v)
+	if w.dbf == nil {
+		return errors.New("initialize DBF by using SetFields first")
+	}
+	if field < 0 || field >= len(w.dbfFields) {
+		return fmt.Errorf("field index %d out of range [0,%d)", field, len(w.dbfFields))
 	}
 
-	if w.dbf == nil {
-		return errors.New("Initialize DBF by using SetFields first")
+	buf, err := formatAttribute(value, w.dbfFields[field].Precision)
+	if err != nil {
+		return err
 	}
+
 	if sz := int(w.dbfFields[field].Size); len(buf) > sz {
-		return fmt.Errorf("Unable to write field %v: %q exceeds field length %v", field, buf, sz)
+		return fmt.Errorf("unable to write field %d (%s): %q exceeds field length %d", field, w.dbfFields[field].String(), buf, sz)
 	}
 
 	seekTo := 1 + int64(w.dbfHeaderLength) + (int64(row) * int64(w.dbfRecordLength))
 	for n := 0; n < field; n++ {
 		seekTo += int64(w.dbfFields[n].Size)
 	}
-	w.dbf.Seek(seekTo, io.SeekStart)
-	return binary.Write(w.dbf, binary.LittleEndian, buf)
+	if _, err := w.dbf.Seek(seekTo, io.SeekStart); err != nil {
+		return err
+	}
+	_, err = w.dbf.Write(buf)
+	return err
+}
+
+// formatAttribute converts a value to its DBF byte representation. Supported
+// types are string, int, int32, int64, float64, bool, time.Time, and pointers
+// to those types (a nil pointer produces an empty value). Floats are formatted
+// with the given decimal precision.
+func formatAttribute(value interface{}, precision uint8) ([]byte, error) {
+	switch v := value.(type) {
+	case string:
+		return []byte(v), nil
+	case int:
+		return []byte(strconv.Itoa(v)), nil
+	case int32:
+		return []byte(strconv.FormatInt(int64(v), 10)), nil
+	case int64:
+		return []byte(strconv.FormatInt(v, 10)), nil
+	case float64:
+		return []byte(strconv.FormatFloat(v, 'f', int(precision), 64)), nil
+	case bool:
+		if v {
+			return []byte("T"), nil
+		}
+		return []byte("F"), nil
+	case time.Time:
+		return []byte(v.Format("20060102")), nil
+	case *string:
+		if v == nil {
+			return nil, nil
+		}
+		return []byte(*v), nil
+	case *int32:
+		if v == nil {
+			return nil, nil
+		}
+		return []byte(strconv.FormatInt(int64(*v), 10)), nil
+	case *int64:
+		if v == nil {
+			return nil, nil
+		}
+		return []byte(strconv.FormatInt(*v, 10)), nil
+	case *float64:
+		if v == nil {
+			return nil, nil
+		}
+		return []byte(strconv.FormatFloat(*v, 'f', int(precision), 64)), nil
+	case nil:
+		return nil, nil
+	default:
+		return nil, fmt.Errorf("unsupported value type %T", value)
+	}
 }
 
 // BBox returns the bounding box of the Writer.

@@ -2,6 +2,8 @@ package shp
 
 import (
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"io"
 	"strings"
 )
@@ -164,6 +166,21 @@ func NewPolyLine(parts [][]Point) *PolyLine {
 	p.Box = p.BBox()
 
 	return p
+}
+
+// NewPolygonFromRings returns a Polygon built from the provided rings. Each
+// ring is a slice of points forming a closed boundary. Rings are closed
+// automatically if their first and last points differ. Multiple rings become
+// multiple parts of the polygon.
+func NewPolygonFromRings(rings [][]Point) *Polygon {
+	closed := make([][]Point, len(rings))
+	for i, ring := range rings {
+		closed[i] = ring
+		if len(ring) >= 2 && ring[0] != ring[len(ring)-1] {
+			closed[i] = append(append([]Point{}, ring...), ring[0])
+		}
+	}
+	return (*Polygon)(NewPolyLine(closed))
 }
 
 // BBox returns the bounding box of the PolyLine feature
@@ -590,36 +607,51 @@ func (f Field) String() string {
 	return strings.TrimRight(string(f.Name[:]), "\x00")
 }
 
-// StringField returns a Field that can be used in SetFields to initialize the
-// DBF file.
-func StringField(name string, length uint8) Field {
-	// TODO: Error checking
-	field := Field{Fieldtype: 'C', Size: length}
+// MaxFieldNameLength is the maximum number of characters in a DBF field name.
+const MaxFieldNameLength = 10
+
+// NewField returns a Field with the given properties, or an error if name is
+// not a valid DBF field name (non-empty and at most MaxFieldNameLength
+// characters).
+func NewField(name string, fieldtype byte, size uint8, precision uint8) (Field, error) {
+	if err := validateFieldName(name); err != nil {
+		return Field{}, err
+	}
+	field := Field{Fieldtype: fieldtype, Size: size, Precision: precision}
 	copy(field.Name[:], []byte(name))
-	return field
+	return field, nil
 }
 
-// NumberField returns a Field that can be used in SetFields to initialize the
-// DBF file.
-func NumberField(name string, length uint8) Field {
-	field := Field{Fieldtype: 'N', Size: length}
-	copy(field.Name[:], []byte(name))
-	return field
+// validateFieldName returns an error if name is not a valid DBF field name.
+func validateFieldName(name string) error {
+	if name == "" {
+		return errors.New("field name must not be empty")
+	}
+	if len(name) > MaxFieldNameLength {
+		return fmt.Errorf("field name %q exceeds %d characters", name, MaxFieldNameLength)
+	}
+	return nil
 }
 
-// FloatField returns a Field that can be used in SetFields to initialize the
-// DBF file. Used to store floating points with precision in the DBF.
-func FloatField(name string, length uint8, precision uint8) Field {
-	field := Field{Fieldtype: 'F', Size: length, Precision: precision}
-	copy(field.Name[:], []byte(name))
-	return field
+// StringField returns a Field for a character ('C') attribute of the given
+// length.
+func StringField(name string, length uint8) (Field, error) {
+	return NewField(name, 'C', length, 0)
 }
 
-// DateField feturns a Field that can be used in SetFields to initialize the
-// DBF file. Used to store Date strings formatted as YYYYMMDD. Data wise this
-// is the same as a StringField with length 8.
-func DateField(name string) Field {
-	field := Field{Fieldtype: 'D', Size: 8}
-	copy(field.Name[:], []byte(name))
-	return field
+// NumberField returns a Field for a numeric ('N') attribute of the given
+// length.
+func NumberField(name string, length uint8) (Field, error) {
+	return NewField(name, 'N', length, 0)
+}
+
+// FloatField returns a Field for a floating-point ('F') attribute with the
+// given length and decimal precision.
+func FloatField(name string, length uint8, precision uint8) (Field, error) {
+	return NewField(name, 'F', length, precision)
+}
+
+// DateField returns a Field for a date ('D') attribute stored as YYYYMMDD.
+func DateField(name string) (Field, error) {
+	return NewField(name, 'D', 8, 0)
 }

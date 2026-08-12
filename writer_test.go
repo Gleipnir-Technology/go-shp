@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"io"
 	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 )
 
 var filenamePrefix = "test_files/write_"
@@ -14,6 +16,8 @@ func removeShapefile(filename string) {
 	os.Remove(filename + ".shp")
 	os.Remove(filename + ".shx")
 	os.Remove(filename + ".dbf")
+	os.Remove(filename + ".prj")
+	os.Remove(filename + ".cpg")
 }
 
 func pointsToFloats(points []Point) [][]float64 {
@@ -40,10 +44,14 @@ func TestAppend(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, p := range points {
-		shape.Write(&Point{p[0], p[1]})
+		if _, err := shape.Write(&Point{p[0], p[1]}); err != nil {
+			t.Fatal(err)
+		}
 	}
 	wantNum := shape.num
-	shape.Close()
+	if err := shape.Close(); err != nil {
+		t.Fatal(err)
+	}
 
 	newPoints := [][]float64{
 		{15.0, 15.0},
@@ -62,7 +70,9 @@ func TestAppend(t *testing.T) {
 	}
 
 	for _, p := range newPoints {
-		shape.Write(&Point{p[0], p[1]})
+		if _, err := shape.Write(&Point{p[0], p[1]}); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	points = append(points, newPoints...)
@@ -89,9 +99,13 @@ func TestWritePoint(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, p := range points {
-		shape.Write(&Point{p[0], p[1]})
+		if _, err := shape.Write(&Point{p[0], p[1]}); err != nil {
+			t.Fatal(err)
+		}
 	}
-	shape.Close()
+	if err := shape.Close(); err != nil {
+		t.Fatal(err)
+	}
 
 	shapes := getShapesFromFile(filename, t)
 	if len(shapes) != len(points) {
@@ -111,7 +125,7 @@ func TestWritePolyLine(t *testing.T) {
 
 	shape, err := Create(filename+".shp", POLYLINE)
 	if err != nil {
-		t.Log(shape, err)
+		t.Fatal(err)
 	}
 
 	l := NewPolyLine(points)
@@ -131,8 +145,12 @@ func TestWritePolyLine(t *testing.T) {
 		t.Errorf("incorrect NewLine: have: %+v; want: %+v", l, lWant)
 	}
 
-	shape.Write(l)
-	shape.Close()
+	if _, err := shape.Write(l); err != nil {
+		t.Fatal(err)
+	}
+	if err := shape.Close(); err != nil {
+		t.Fatal(err)
+	}
 
 	shapes := getShapesFromFile(filename, t)
 	if len(shapes) != 1 {
@@ -158,13 +176,21 @@ func (s *seekTracker) Close() error {
 func TestWriteAttribute(t *testing.T) {
 	buf := new(bytes.Buffer)
 	s := &seekTracker{Writer: buf}
+	aString, err := StringField("A_STRING", 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aFloat, err := FloatField("A_FLOAT", 8, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	anInt, err := NumberField("AN_INT", 4)
+	if err != nil {
+		t.Fatal(err)
+	}
 	w := Writer{
-		dbf: s,
-		dbfFields: []Field{
-			StringField("A_STRING", 6),
-			FloatField("A_FLOAT", 8, 4),
-			NumberField("AN_INT", 4),
-		},
+		dbf:             s,
+		dbfFields:       []Field{aString, aFloat, anInt},
 		dbfRecordLength: 100,
 	}
 
@@ -205,5 +231,214 @@ func TestWriteAttribute(t *testing.T) {
 				t.Error("got no data and no error")
 			}
 		})
+	}
+}
+
+func TestFieldNameValidation(t *testing.T) {
+	if _, err := StringField("", 10); err == nil {
+		t.Error("expected error for empty field name")
+	}
+	if _, err := StringField("TOO_LONG_NAME", 10); err == nil {
+		t.Error("expected error for over-long field name")
+	}
+	if _, err := StringField("OK", 10); err != nil {
+		t.Errorf("unexpected error for valid name: %v", err)
+	}
+	if _, err := StringField("1234567890", 10); err != nil {
+		t.Errorf("unexpected error for 10-char name: %v", err)
+	}
+}
+
+func TestNewPolygonFromRings(t *testing.T) {
+	ring := []Point{{0, 0}, {0, 1}, {1, 1}, {1, 0}}
+	p := NewPolygonFromRings([][]Point{ring})
+	if p.NumParts != 1 {
+		t.Fatalf("NumParts = %d, want 1", p.NumParts)
+	}
+	if p.NumPoints != 5 {
+		t.Fatalf("NumPoints = %d, want 5 (closed ring)", p.NumPoints)
+	}
+	if p.Points[0] != p.Points[len(p.Points)-1] {
+		t.Error("ring not closed")
+	}
+
+	closedRing := append(append([]Point{}, ring...), ring[0])
+	p2 := NewPolygonFromRings([][]Point{closedRing})
+	if p2.NumPoints != 5 {
+		t.Fatalf("NumPoints = %d, want 5 (already closed)", p2.NumPoints)
+	}
+}
+
+func TestWriteCloseSidecars(t *testing.T) {
+	filename := filenamePrefix + "sidecar"
+	defer removeShapefile(filename)
+	shape, err := Create(filename+".shp", POINT)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const wkt = `GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563]]]`
+	shape.SetProjection(wkt)
+	shape.SetEncoding("UTF-8")
+	if _, err := shape.Write(&Point{1, 2}); err != nil {
+		t.Fatal(err)
+	}
+	if err := shape.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	prj, err := os.ReadFile(filename + ".prj")
+	if err != nil {
+		t.Fatalf("read .prj: %v", err)
+	}
+	if string(prj) != wkt {
+		t.Errorf(".prj content = %q, want %q", prj, wkt)
+	}
+	cpg, err := os.ReadFile(filename + ".cpg")
+	if err != nil {
+		t.Fatalf("read .cpg: %v", err)
+	}
+	if string(cpg) != "UTF-8" {
+		t.Errorf(".cpg content = %q, want %q", cpg, "UTF-8")
+	}
+}
+
+func ptrFloat(f float64) *float64 { return &f }
+
+func TestFormatAttribute(t *testing.T) {
+	tests := []struct {
+		name      string
+		value     interface{}
+		precision uint8
+		want      string
+		wantErr   bool
+	}{
+		{"string", "hi", 0, "hi", false},
+		{"int", 42, 0, "42", false},
+		{"int32", int32(-42), 0, "-42", false},
+		{"int64", int64(123456), 0, "123456", false},
+		{"float64", 3.14159, 2, "3.14", false},
+		{"bool-true", true, 0, "T", false},
+		{"bool-false", false, 0, "F", false},
+		{"time", time.Date(2026, 8, 12, 0, 0, 0, 0, time.UTC), 0, "20260812", false},
+		{"nil", nil, 0, "", false},
+		{"nil-float-ptr", (*float64)(nil), 0, "", false},
+		{"float-ptr", ptrFloat(2.5), 2, "2.50", false},
+		{"unsupported", []int{1}, 0, "", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := formatAttribute(tt.value, tt.precision)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != tt.want {
+				t.Errorf("got %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+type failingWriteSeekCloser struct{}
+
+func (f *failingWriteSeekCloser) Write(p []byte) (int, error) { return 0, io.ErrShortWrite }
+func (f *failingWriteSeekCloser) Seek(offset int64, whence int) (int64, error) {
+	return offset, nil
+}
+func (f *failingWriteSeekCloser) Close() error { return nil }
+
+func TestWritePropagatesError(t *testing.T) {
+	buf := new(bytes.Buffer)
+	shp := &failingWriteSeekCloser{}
+	shx := &seekTracker{Writer: buf}
+	w, err := CreateFromWriteSeekClosers(shp, shx, nil, POINT)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write(&Point{1, 2}); err == nil {
+		t.Fatal("expected error from Write")
+	}
+}
+
+func TestWriteZip(t *testing.T) {
+	dir, err := os.MkdirTemp("", "go-shp-ziptest-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	zipPath := filepath.Join(dir, "out.zip")
+	f, err := os.Create(zipPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	layers := []Layer{
+		{
+			Base: "sites",
+			Type: POINT,
+			Populate: func(w *Writer) error {
+				nameField, err := StringField("NAME", 20)
+				if err != nil {
+					return err
+				}
+				if err := w.SetFields([]Field{nameField}); err != nil {
+					return err
+				}
+				if _, err := w.Write(&Point{10, 20}); err != nil {
+					return err
+				}
+				return w.WriteAttribute(0, 0, "first")
+			},
+		},
+		{
+			Base: "pools",
+			Type: POLYGON,
+			Populate: func(w *Writer) error {
+				w.SetProjection("WGS84")
+				ring := []Point{{0, 0}, {0, 1}, {1, 1}, {1, 0}}
+				_, err := w.Write(NewPolygonFromRings([][]Point{ring}))
+				return err
+			},
+		},
+	}
+	if err := WriteZip(f, layers...); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	zr, err := OpenShapeFromZip(zipPath, "sites.shp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer zr.Close()
+	if !zr.Next() {
+		t.Fatal("expected a shape in sites layer")
+	}
+	_, shape := zr.Shape()
+	if _, ok := shape.(*Point); !ok {
+		t.Fatalf("sites shape type = %T, want *Point", shape)
+	}
+	if fields := zr.Fields(); len(fields) != 1 || fields[0].String() != "NAME" {
+		t.Fatalf("sites fields = %v, want [NAME]", fields)
+	}
+
+	zr2, err := OpenShapeFromZip(zipPath, "pools.shp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer zr2.Close()
+	if !zr2.Next() {
+		t.Fatal("expected a shape in pools layer")
+	}
+	_, shape2 := zr2.Shape()
+	if _, ok := shape2.(*Polygon); !ok {
+		t.Fatalf("pools shape type = %T, want *Polygon", shape2)
 	}
 }

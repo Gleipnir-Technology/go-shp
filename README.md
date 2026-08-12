@@ -74,25 +74,30 @@ points := []shp.Point{
 }
 	
 // fields to write
-fields := []shp.Field{
-	// String attribute field with length 25
-	shp.StringField("NAME", 25),
+nameField, err := shp.StringField("NAME", 25)
+if err != nil {
+	log.Fatal(err)
 }
+fields := []shp.Field{nameField}
 	
 // create and open a shapefile for writing points
 shape, err := shp.Create("points.shp", shp.POINT)
 if err != nil { log.Fatal(err) }
-defer shape.Close()
+defer func() { _ = shape.Close() }()
+	
+// write projection and encoding sidecar files
+shape.SetProjection(`GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563]]]`)
+shape.SetEncoding("UTF-8")
 	
 // setup fields for attributes
-shape.SetFields(fields)
+if err := shape.SetFields(fields); err != nil { log.Fatal(err) }
 	
 // write points and attributes
 for n, point := range points {
-	shape.Write(&point)
+	if _, err := shape.Write(&point); err != nil { log.Fatal(err) }
 	
 	// write attribute for object n for field 0 (NAME)
-	shape.WriteAttribute(n, 0, "Point " + strconv.Itoa(n + 1))
+	if err := shape.WriteAttribute(n, 0, "Point " + strconv.Itoa(n + 1)); err != nil { log.Fatal(err) }
 }
 ```
 
