@@ -1,7 +1,10 @@
 package shp
 
 import (
+	"bytes"
+	"io"
 	"io/ioutil"
+	"os"
 	"testing"
 )
 
@@ -18,12 +21,22 @@ func pointsEqual(a, b []float64) bool {
 }
 
 func getShapesFromFile(prefix string, t *testing.T) (shapes []Shape) {
-	filename := prefix + ".shp"
-	file, err := Open(filename)
+	dbf, err := os.Open(prefix + ".dbf")
 	if err != nil {
-		t.Fatal("Failed to open shapefile: " + filename + " (" + err.Error() + ")")
+		t.Fatal("Failed to open databaseFile: " + prefix + ".dbf (" + err.Error() + ")")
 	}
-	defer file.Close()
+	defer func() { _ = dbf.Close() }()
+
+	shp, err := os.Open(prefix + ".shp")
+	if err != nil {
+		t.Fatal("Failed to open shapefile: " + prefix + ".shp (" + err.Error() + ")")
+	}
+	defer func() { _ = shp.Close() }()
+
+	file, err := New(shp, WithSeekableDBF(dbf))
+	if err != nil {
+		t.Fatal("Failed to open shapefile: " + prefix + " (" + err.Error() + ")")
+	}
 
 	for file.Next() {
 		_, shape := file.Shape()
@@ -230,22 +243,35 @@ func TestReadBBox(t *testing.T) {
 		filename string
 		want     Box
 	}{
-		{"test_files/multipatch.shp", Box{0, 0, 10, 10}},
-		{"test_files/multipoint.shp", Box{0, 5, 10, 10}},
-		{"test_files/multipointm.shp", Box{0, 5, 10, 10}},
-		{"test_files/multipointz.shp", Box{0, 5, 10, 10}},
-		{"test_files/point.shp", Box{0, 5, 10, 10}},
-		{"test_files/pointm.shp", Box{0, 5, 10, 10}},
-		{"test_files/pointz.shp", Box{0, 5, 10, 10}},
-		{"test_files/polygon.shp", Box{0, 0, 5, 5}},
-		{"test_files/polygonm.shp", Box{0, 0, 5, 5}},
-		{"test_files/polygonz.shp", Box{0, 0, 5, 5}},
-		{"test_files/polyline.shp", Box{0, 0, 25, 25}},
-		{"test_files/polylinem.shp", Box{0, 0, 25, 25}},
-		{"test_files/polylinez.shp", Box{0, 0, 25, 25}},
+		{"test_files/multipatch", Box{0, 0, 10, 10}},
+		{"test_files/multipoint", Box{0, 5, 10, 10}},
+		{"test_files/multipointm", Box{0, 5, 10, 10}},
+		{"test_files/multipointz", Box{0, 5, 10, 10}},
+		{"test_files/point", Box{0, 5, 10, 10}},
+		{"test_files/pointm", Box{0, 5, 10, 10}},
+		{"test_files/pointz", Box{0, 5, 10, 10}},
+		{"test_files/polygon", Box{0, 0, 5, 5}},
+		{"test_files/polygonm", Box{0, 0, 5, 5}},
+		{"test_files/polygonz", Box{0, 0, 5, 5}},
+		{"test_files/polyline", Box{0, 0, 25, 25}},
+		{"test_files/polylinem", Box{0, 0, 25, 25}},
+		{"test_files/polylinez", Box{0, 0, 25, 25}},
 	}
 	for _, tt := range tests {
-		r, err := Open(tt.filename)
+		dbf, err := os.Open(tt.filename + ".dbf")
+		if err != nil {
+			t.Fatal("Failed to open databaseFile: " + tt.filename + ".dbf (" + err.Error() + ")")
+		}
+		defer func() { _ = dbf.Close() }()
+
+		shp, err := os.Open(tt.filename + ".shp")
+		if err != nil {
+			t.Fatal("Failed to open shapefile: " + tt.filename + ".shp (" + err.Error() + ")")
+		}
+		defer func() { _ = shp.Close() }()
+
+		r, err := New(shp, WithSeekableDBF(dbf))
+
 		if err != nil {
 			t.Fatalf("%v", err)
 		}
@@ -261,29 +287,6 @@ func TestReadBBox(t *testing.T) {
 		if got := r.BBox().MaxY; got != tt.want.MaxY {
 			t.Errorf("got MaxY = %v, want %v", got, tt.want.MaxY)
 		}
-	}
-
-	// Test a single file from buffers, no need to test all files since all other flow is the same
-
-	shpData, err := ioutil.ReadFile("test_files/multipatch.shp")
-	dbfData, err := ioutil.ReadFile("test_files/multipatch.dbf")
-	want := Box{0, 0, 10, 10}
-
-	r, err := OpenFromMemory(shpData, dbfData)
-	if err != nil {
-		t.Fatalf("%v", err)
-	}
-	if got := r.BBox().MinX; got != want.MinX {
-		t.Errorf("got MinX = %v, want %v", got, want.MinX)
-	}
-	if got := r.BBox().MinY; got != want.MinY {
-		t.Errorf("got MinY = %v, want %v", got, want.MinY)
-	}
-	if got := r.BBox().MaxX; got != want.MaxX {
-		t.Errorf("got MaxX = %v, want %v", got, want.MaxX)
-	}
-	if got := r.BBox().MaxY; got != want.MaxY {
-		t.Errorf("got MaxY = %v, want %v", got, want.MaxY)
 	}
 }
 
@@ -507,6 +510,16 @@ func TestReadMultiPatch(t *testing.T) {
 	testshapeIdentity(t, "test_files/multipatch", getShapesFromFile)
 }
 
+func newReadSeekCloser(b []byte) readSeekCloser {
+	return struct {
+		io.Closer
+		io.ReadSeeker
+	}{
+		ioutil.NopCloser(nil),
+		bytes.NewReader(b),
+	}
+}
+
 func TestReadInvalidShapeType(t *testing.T) {
 	record := []byte{
 		0, 0, 0, 1,
@@ -521,8 +534,8 @@ func TestReadInvalidShapeType(t *testing.T) {
 		}
 		name string
 	}{
-		{&Reader{shp: NewReadSeekCloserFromBytes(record), filelength: int64(len(record))}, "reader"},
-		{&seqReader{shp: NewReadSeekCloserFromBytes(record), filelength: int64(len(record))}, "seqReader"},
+		{&Reader{shp: newReadSeekCloser(record), filelength: int64(len(record))}, "reader"},
+		{&seqReader{shp: newReadSeekCloser(record), filelength: int64(len(record))}, "seqReader"},
 	}
 
 	for _, test := range tests {
