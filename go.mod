@@ -1,3 +1,3 @@
-module github.com/landru29/go-shp
+module github.com/Gleipnir-Technology/go-shp
 
 go 1.14
