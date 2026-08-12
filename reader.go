@@ -33,6 +33,8 @@ type Reader struct {
 	dbfNumRecords   int32
 	dbfHeaderLength int16
 	dbfRecordLength int16
+
+	memoryData *memoryShapeData
 }
 
 // ReadSeekCloser is the union of the io.Reader, io.Seeker and io.Closer interfaces
@@ -53,6 +55,25 @@ func (b *bytesReadSeekCloser) Close() error {
 // NewReadSeekCloserFromBytes is a convenience method to create a ReadSeekCloser from a slice of bytes
 func NewReadSeekCloserFromBytes(data []byte) ReadSeekCloser {
 	return &bytesReadSeekCloser{Reader: bytes.NewReader(data)}
+}
+
+type byteSeekCloser struct {
+	bytes.Reader
+}
+
+func (bsc *byteSeekCloser) Close() error {
+	return nil
+}
+
+func newBytesReader(data []byte) *byteSeekCloser {
+	return &byteSeekCloser{
+		Reader: *bytes.NewReader(data),
+	}
+}
+
+type memoryShapeData struct {
+	shpFileData []byte
+	dbfFileData []byte
 }
 
 // Open opens a Shapefile for reading. The filename must have a .shp extension, and a companion .dbf file must be
@@ -86,6 +107,18 @@ func Read(shp, dbf ReadSeekCloser) (*Reader, error) {
 	if err != nil {
 		return nil, err
 	}
+	return s, nil
+}
+
+// Open opens a Shapefile for reading using memory buffers
+func OpenFromMemory(shpFileData, dbfFileData []byte) (*Reader, error) {
+	mD := &memoryShapeData{
+		shpFileData: shpFileData,
+		dbfFileData: dbfFileData,
+	}
+
+	s := &Reader{filename: "", shp: newBytesReader(mD.shpFileData), memoryData: mD}
+	s.readHeaders()
 	return s, nil
 }
 
@@ -248,12 +281,15 @@ func (r *Reader) openDbf() (err error) {
 	}
 
 	if r.dbf == nil {
-		if r.filename == "" {
+		if r.memoryData != nil {
+			r.dbf = newBytesReader(r.memoryData.dbfFileData)
+		} else if r.filename != "" {
+			r.dbf, err = os.Open(r.filename + ".dbf")
+			if err != nil {
+				return err
+			}
+		} else {
 			return errors.New("No dbf reader specified")
-		}
-		r.dbf, err = os.Open(r.filename + ".dbf")
-		if err != nil {
-			return err
 		}
 	}
 

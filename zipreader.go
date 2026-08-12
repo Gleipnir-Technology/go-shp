@@ -2,6 +2,7 @@ package shp
 
 import (
 	"archive/zip"
+	"errors"
 	"fmt"
 	"io"
 	"path"
@@ -128,7 +129,7 @@ func (zr *ZipReader) Close() error {
 		}
 	}
 	if s != "" {
-		return fmt.Errorf(s)
+		return errors.New(s)
 	}
 	return nil
 }

@@ -1,6 +1,7 @@
 package shp
 
 import (
+	"io/ioutil"
 	"testing"
 )
 
@@ -260,6 +261,29 @@ func TestReadBBox(t *testing.T) {
 		if got := r.BBox().MaxY; got != tt.want.MaxY {
 			t.Errorf("got MaxY = %v, want %v", got, tt.want.MaxY)
 		}
+	}
+
+	// Test a single file from buffers, no need to test all files since all other flow is the same
+
+	shpData, err := ioutil.ReadFile("test_files/multipatch.shp")
+	dbfData, err := ioutil.ReadFile("test_files/multipatch.dbf")
+	want := Box{0, 0, 10, 10}
+
+	r, err := OpenFromMemory(shpData, dbfData)
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+	if got := r.BBox().MinX; got != want.MinX {
+		t.Errorf("got MinX = %v, want %v", got, want.MinX)
+	}
+	if got := r.BBox().MinY; got != want.MinY {
+		t.Errorf("got MinY = %v, want %v", got, want.MinY)
+	}
+	if got := r.BBox().MaxX; got != want.MaxX {
+		t.Errorf("got MaxX = %v, want %v", got, want.MaxX)
+	}
+	if got := r.BBox().MaxY; got != want.MaxY {
+		t.Errorf("got MaxY = %v, want %v", got, want.MaxY)
 	}
 }
 
